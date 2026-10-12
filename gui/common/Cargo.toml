@@ -1,0 +1,20 @@
+[package]
+name = "lunaris_gui_common"
+version.workspace = true
+authors.workspace = true
+categories.workspace = true
+description = "Backend-neutral GUI helpers shared between the imgui and egui front ends"
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nds-core = { workspace = true }
+free_bios = { workspace = true }
+serde = { workspace = true }
+xbrz-rs = "0.1.0"
+zstd = "0.13"
+serde_json = "1.0.149"

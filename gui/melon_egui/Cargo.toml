@@ -1,0 +1,70 @@
+# egui front end for the *melonDS* core, via the `melonds-rs` bindings.
+#
+# Purpose: a reference renderer whose emulation is known-good, so lunaris's own
+# output (and its wifi traces) can be compared against melonDS without needing
+# melonDS's Qt frontend built. See docs/design/review_mp_local2.md §7.
+#
+# Building this crate compiles the melonDS C++ core, which needs an LLVM
+# toolchain -- see src/main.rs for the environment it expects.
+[package]
+name = "melon_egui"
+version.workspace = true
+authors.workspace = true
+categories.workspace = true
+description.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[build-dependencies]
+winres = "0.1.12" # Meta information can be added to the exe.
+
+[dependencies]
+eframe = { version = "0.33", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "x11",
+    "wayland",
+] }
+egui = "0.33"
+# The paint callback that draws the core's GL texture inside eframe's context.
+egui_glow = "0.33"
+# The window and task bar icon, decoded from `docs/icons/icon.ico` at startup.
+# `build.rs` puts the same file in the executable's resources, but that is for
+# the shell and only in a release build -- a window is told separately.
+ico = "0.5.0"
+rfd = "0.14"
+pollster = { version = "1.0.1" }
+
+# Audio output. Same versions the core already uses, so no extra crates enter
+# the build.
+cpal = "0.13.1"
+ringbuf = "0.2.2"
+
+# Remembering the recent-ROM list and the View menu's settings between runs.
+serde.workspace = true
+serde_json = "1.0.149"
+
+# Only used by `--selftest --dump`, to make the core's picture inspectable
+# without a window. Same version core's own frame dumper uses.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+melonds = { git = "https://github.com/Thoughts-with-friends/melonds-rs.git", rev = "9d44665" }
+# Game controllers. Its Windows back end is XInput plus the vendored SDL
+# mapping database, so a pad works without anything installed beside the exe.
+gilrs = "0.11"
+xbrz-rs = "0.1.0"
+log = "0.4"
+indexmap = { version = "2.14.0", features = ["serde"] }
+snafu = { version = "0.9.2" }
+
+i18n_derive = { path = "../i18n_derive" }
+# The wireless medium: melonDS's MP/LAN layer over FFI (this workspace).
+melonds_net = { workspace = true }
+
+[features]
+# Windows only: hides the console window and is what a distributed build sets.
+release = []

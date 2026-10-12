@@ -1,0 +1,233 @@
+//! The handle the UI thread holds, and what crosses between the two.
+
+use super::*;
+
+/// A handle to the second console.
+pub struct Guest {
+    pub(crate) input: Arc<Mutex<Input>>,
+    pub(crate) output: Arc<Mutex<Output>>,
+    /// Menu commands waiting to be performed between frames. A queue rather
+    /// than a single slot so that two clicks in one repaint both land.
+    pub(crate) commands: Arc<Mutex<Vec<Command>>>,
+    /// Asks the thread to wind up. Set by [`Drop`], so closing the window and
+    /// dropping the handle are the same thing.
+    pub(crate) quit: Arc<AtomicBool>,
+    /// Mirrors the front end's own pause, so the second console stops with the
+    /// first rather than running on alone.
+    pub(crate) paused: Arc<AtomicBool>,
+    /// Frames run, readable without taking the output lock.
+    pub(crate) frames: Arc<AtomicU32>,
+    pub(crate) handle: Option<JoinHandle<()>>,
+}
+
+impl Guest {
+    /// Boot `rom` as console `instance_id` on `mp`, on a thread of its own.
+    ///
+    /// Returns at once; a boot failure arrives later through
+    /// [`Self::take_note`].
+    ///
+    /// * `start_frame` — the frame count to start at. It is the wifi clock's
+    ///   epoch, so it must match the console being joined.
+    /// * `stream` — Remote Desktop only: this console's picture and sound go
+    ///   out over it and its controls come back from it ([`crate::remote`]).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a distinct decision the caller makes once, at boot; \
+                  gathering them into a struct would only move the same list"
+    )]
+    pub fn spawn(
+        rom: &Path,
+        save_dir: Option<PathBuf>,
+        state_dir: Option<PathBuf>,
+        cheat_dir: Option<PathBuf>,
+        instance_id: u32,
+        mp: Client,
+        start_frame: u32,
+        stream: Option<Arc<RemoteHost>>,
+    ) -> Self {
+        let input = Arc::new(Mutex::new(Input::default()));
+        let output = Arc::new(Mutex::new(Output::default()));
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let quit = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let frames = Arc::new(AtomicU32::new(start_frame));
+
+        let handle = {
+            let (rom, input, output, commands, quit, paused, frames) = (
+                rom.to_path_buf(),
+                Arc::clone(&input),
+                Arc::clone(&output),
+                Arc::clone(&commands),
+                Arc::clone(&quit),
+                Arc::clone(&paused),
+                Arc::clone(&frames),
+            );
+            std::thread::Builder::new()
+                .name("melon_egui-instance2".to_owned())
+                .spawn(move || {
+                    run(RunConfig {
+                        rom: &rom,
+                        save_dir,
+                        state_dir,
+                        cheat_dir,
+                        instance_id,
+                        mp,
+                        start_frame,
+                        stream,
+                        shared: &Shared {
+                            input,
+                            output,
+                            commands,
+                            quit,
+                            paused,
+                            frames,
+                        },
+                    });
+                })
+                .ok()
+        };
+
+        Self {
+            input,
+            output,
+            commands,
+            quit,
+            paused,
+            frames,
+            handle,
+        }
+    }
+
+    /// Queue a menu command for the console's thread. The result arrives later
+    /// through [`Self::take_note`].
+    pub fn send(&self, command: Command) {
+        if let Ok(mut commands) = self.commands.lock() {
+            commands.push(command);
+        }
+    }
+
+    /// Hand down this repaint's input.
+    pub fn set_input(&self, keys: u32, touch: Option<(u16, u16)>) {
+        if let Ok(mut input) = self.input.lock() {
+            *input = Input { keys, touch };
+        }
+    }
+
+    /// Run or hold, following the front end's own pause.
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
+
+    /// The newest picture, if there is a new one since last time. Taken rather
+    /// than borrowed, so the lock is not held across a texture upload.
+    pub fn take_screens(&self) -> Option<[Screen; 2]> {
+        self.output.lock().ok()?.screens.take()
+    }
+
+    /// Anything the console has to say — a boot failure, a stop — once.
+    pub fn take_note(&self) -> Option<Note> {
+        self.output.lock().ok()?.note.take()
+    }
+
+    /// Whether the console has stopped for good, so the front end can close its
+    /// window rather than show a still picture forever.
+    pub fn finished(&self) -> bool {
+        self.output.lock().is_ok_and(|out| out.finished)
+    }
+
+    /// Frames run, for the stop report.
+    pub fn frame_count(&self) -> u32 {
+        self.frames.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Guest {
+    /// Stop the thread and wait for it, so the save is flushed and the airwaves
+    /// seat is released before anything else happens.
+    fn drop(&mut self) {
+        self.quit.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// What the UI thread hands down each repaint.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Input {
+    pub(crate) keys: u32,
+    /// Touch position, or `None` for the stylus lifted.
+    pub(crate) touch: Option<(u16, u16)>,
+}
+
+/// What the console hands up.
+#[derive(Default)]
+pub(crate) struct Output {
+    /// The newest picture, `[top, bottom]`. `None` until the first frame.
+    pub(crate) screens: Option<[Screen; 2]>,
+    /// Frames run, for the stop report.
+    pub(crate) frames: u32,
+    /// The last thing worth saying: a boot failure, or why it stopped.
+    pub(crate) note: Option<Note>,
+    /// Set once the console has stopped for good.
+    pub(crate) finished: bool,
+}
+
+/// The halves of [`Guest`] the thread keeps.
+pub(crate) struct Shared {
+    pub(crate) input: Arc<Mutex<Input>>,
+    pub(crate) output: Arc<Mutex<Output>>,
+    pub(crate) commands: Arc<Mutex<Vec<Command>>>,
+    pub(crate) quit: Arc<AtomicBool>,
+    pub(crate) paused: Arc<AtomicBool>,
+    pub(crate) frames: Arc<AtomicU32>,
+}
+
+/// Something the second console has to say, as a key and its values rather
+/// than as text: this thread has no access to the UI's strings, and the UI
+/// may switch language before the note is read.
+#[derive(Clone, Debug)]
+pub struct Note {
+    pub key: K,
+    pub args: Vec<String>,
+}
+
+impl Note {
+    pub(crate) fn new(key: K, args: &[&dyn std::fmt::Display]) -> Self {
+        Self {
+            key,
+            args: args.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    /// The note in the UI's language.
+    #[must_use]
+    pub fn render(&self, tr: &crate::i18n::I18nMap) -> String {
+        let args: Vec<&dyn std::fmt::Display> = self
+            .args
+            .iter()
+            .map(|arg| arg as &dyn std::fmt::Display)
+            .collect();
+        tr.f(self.key, &args)
+    }
+
+    /// The note in English, for the log and the stop report.
+    #[must_use]
+    pub fn english(&self) -> String {
+        self.render(&crate::i18n::I18nMap::built_in(
+            crate::i18n::Language::English,
+        ))
+    }
+}
+
+impl Shared {
+    pub(crate) fn say(&self, note: Note) {
+        log::info!("second instance: {}", note.english());
+        if let Ok(mut out) = self.output.lock() {
+            out.note = Some(note);
+        }
+    }
+}
+
+/// One screen's worth of pixels, BGRA8888.
+pub(crate) type Screen = Vec<u32>;

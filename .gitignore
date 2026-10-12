@@ -1,0 +1,17 @@
+*.bin
+*.nds
+*.sav
+*.log
+
+.claude/
+.serena/
+.tanstack/
+
+target/
+logs/
+instances/
+
+docs/design/
+docs/icon.drawio.svg
+
+config.json

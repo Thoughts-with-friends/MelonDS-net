@@ -1,0 +1,15 @@
+[package]
+name = "melonds_net"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+description = "Nintendo DS networking (local wireless MP, LAN, Wi-Fi AP + internet) from melonDS, over a C++ FFI"
+links = "mdsnet"
+build = "build.rs"
+
+[dependencies]
+log = { workspace = true }
+
+[build-dependencies]
+cc = { version = "1", features = ["parallel"] }

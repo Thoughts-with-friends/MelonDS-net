@@ -1,0 +1,305 @@
+// Suppress the console window that Windows otherwise attaches to a distributed
+// build, matching `gui/egui` and `gui/imgui`. Left on for ordinary builds so
+// that `--selftest` and `--shot` still have somewhere to print.
+#![cfg_attr(feature = "release", windows_subsystem = "windows")]
+
+//! egui front end for the melonDS core.
+//!
+//! # Why this crate exists
+//!
+//! melonDS's own front end is Qt-based, which is awkward to build on Windows.
+//! This crate drives the same emulator core through the [`melonds`] bindings
+//! (`melonds-rs`, GPL-3.0-or-later, as is lunaris) and renders it with egui,
+//! giving a known-good reference picture to compare lunaris's own renderer and
+//! wifi traces against.
+//!
+//! # Building
+//!
+//! Building this crate compiles the melonDS C++ core, and `melonds-sys` drives
+//! that build with **clang targeting the MSVC ABI** (melonDS is GCC/Clang code
+//! that `cl.exe` cannot compile). On Windows its build script therefore needs
+//! an LLVM install, and `bindgen` needs the matching `libclang.dll`:
+//!
+//! ```text
+//! $env:LLVM_ROOT     = "<VS>/VC/Tools/Llvm/x64"      # holds bin/clang.exe
+//! $env:LIBCLANG_PATH = "$env:LLVM_ROOT/bin"
+//! cargo run -p melon_egui --release
+//! ```
+//!
+//! Visual Studio's bundled LLVM component satisfies both; a standalone
+//! `winget install LLVM.LLVM` does too. `cargo xtask run --gui melon` fills
+//! these in automatically by locating Visual Studio with `vswhere`.
+//!
+//! # A single, standalone executable
+//!
+//! ```text
+//! cargo xtask build --gui melon --release
+//! ```
+//!
+//! The melonDS core is linked in statically, so the result is one `.exe` that
+//! needs no emulator installation, no BIOS or firmware files, and no DLLs beyond
+//! what Windows itself ships: the release build additionally turns off the
+//! console window and links the MSVC runtime statically, so it does not need the
+//! Visual C++ redistributable either. Nothing above is required at run time --
+//! LLVM is a build-time dependency only.
+//!
+//! # Self test
+//!
+//! Two headless harnesses, for two different jobs. Both fix the RTC (see
+//! [`emu::use_deterministic_rtc`]) so that repeating a run shows the same frame.
+//!
+//! `melon_egui --selftest <rom.nds> [frames] [--dump <prefix>]` boots a cart
+//! without a window, reports how much of the framebuffer is non-black, and
+//! optionally writes both screens out as PNGs. **This is the one to use for
+//! comparing against lunaris** (against `core/examples/dump_frame.rs`): it
+//! captures the framebuffers themselves, so nothing about the window can get
+//! into the picture.
+//!
+//! Either harness (and an ordinary run) also takes
+//! `--renderer <software|opengl|compute>[@scale]`, which overrides the saved
+//! Video settings for that run alone. Three `--shot` captures of one cart at
+//! one frame, one per renderer, are how the renderers are compared; under an
+//! OpenGL renderer `--shot` additionally writes `<out>_core_top.png` and
+//! `<out>_core_bottom.png`, read back from the core's texture at the internal
+//! resolution, which is where the upscaling is actually visible.
+//!
+//! `melon_egui --shot <frames> <out.png> <rom.nds>` captures the real window
+//! instead, proving that egui's texture upload and compositing work rather than
+//! just the core. Note it photographs the window as it *is*, menus and hover
+//! highlights included, so it is a UI check and not a source of reference
+//! images.
+
+// # Startup
+//
+// ```text
+// main()
+//  1. install the logger (instance1/logs), log where the instance tree is
+//  2. take --renderer and --mp out of the arguments
+//  3. --selftest → run headless, exit with its code
+//     --shot     → fixed RTC, then continue as a window
+//  4. read settings.json for the window size and vsync
+//  5. eframe::run_native → MelonEgui::new (app/boot.rs)
+//                        → update() every repaint (ui/frame.rs)
+// ```
+
+// Each module explains itself in its own header; README.md has the map.
+mod app;
+mod audio;
+mod bindings;
+mod emu;
+mod file;
+mod fonts;
+mod gl_screen;
+mod guest;
+mod i18n;
+mod lan;
+mod logger;
+mod mp;
+mod pad;
+mod remote;
+mod selftest;
+mod speed;
+mod ui;
+mod upscale;
+mod video;
+
+fn main() -> eframe::Result<()> {
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+
+    // Before anything that could fail, so its diagnostic is recorded rather
+    // than dropped. A headless harness prints at `Info` whatever `RUST_LOG`
+    // says, because its report *is* its output; a windowed run keeps the quiet
+    // default. See [`logger`].
+    let headless = matches!(
+        argv.first().map(String::as_str),
+        Some("--selftest" | "--shot")
+    )
+    .then_some(log::LevelFilter::Info);
+    logger::install(&file::settings::instance_data_dir(1, "logs"), headless);
+    // The first thing in every log, because everything else this program reads
+    // or writes hangs off it: a save that "vanished" is nearly always a run
+    // that resolved this somewhere else. See `file::settings::instances_dir`.
+    log::info!(
+        "instance tree: {}",
+        file::settings::instances_dir().display()
+    );
+
+    // Pulled out before the positional arguments are read, so it can be
+    // written last on the command line where it reads naturally.
+    let renderer = take_renderer(&mut argv);
+    // `--mp` opens the second console as soon as the cart is loaded, which is
+    // what makes a link testable from a shell.
+    let mp = take_flag(&mut argv, "--mp");
+    // `--lan-host` / `--lan-join <ip>`: put this window's console on melonDS's
+    // LAN backend (via melonds_net) instead of the in-process LocalMP.
+    start_lan(&mut argv);
+    let mut args = argv.into_iter();
+    let first = args.next();
+
+    if first.as_deref() == Some("--selftest") {
+        let rom = args.next().unwrap_or_else(|| {
+            log::error!("usage: melon_egui --selftest <rom.nds> [frames] [--dump <prefix>]");
+            std::process::exit(2);
+        });
+        let frames = args.next().and_then(|n| n.parse().ok()).unwrap_or(600);
+        let dump = (args.next().as_deref() == Some("--dump"))
+            .then(|| args.next())
+            .flatten();
+        emu::use_deterministic_rtc();
+        std::process::exit(selftest::run(
+            std::path::Path::new(&rom),
+            frames,
+            dump.as_deref(),
+        ));
+    }
+
+    // `--shot <frames> <out.png> <rom>` runs the real window, captures it once
+    // the cart has run that many frames, and exits. Unlike `--selftest` this
+    // goes through egui's own texture upload and compositing, so it is what
+    // proves the *window* renders rather than just the core.
+    let shot = if first.as_deref() == Some("--shot") {
+        let frames = args.next().and_then(|n| n.parse().ok());
+        let out = args.next();
+        match (frames, out) {
+            (Some(frames), Some(out)) => Some((frames, std::path::PathBuf::from(out))),
+            _ => {
+                log::error!("usage: melon_egui --shot <frames> <out.png> <rom.nds>");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+    if shot.is_some() {
+        // A capture is only worth comparing if repeating it shows the same
+        // thing; see `emu::use_deterministic_rtc`.
+        emu::use_deterministic_rtc();
+    }
+
+    // Any remaining argument is taken as a ROM to boot straight into, which is
+    // what makes the front end scriptable from a shell.
+    let rom = if shot.is_some() { args.next() } else { first }.map(std::path::PathBuf::from);
+
+    // Vsync is fixed when the surface is created, so it is read from the saved
+    // settings here rather than applied live from the Video settings dialog.
+    let json_config = file::settings::Settings::load();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([json_config.window.width, json_config.window.height])
+            .with_position([json_config.window.pos_x, json_config.window.pos_y])
+            .with_title("melon_egui")
+            .with_icon(lunaris_icon()),
+        vsync: json_config.video.vsync,
+        ..Default::default()
+    };
+
+    // MelonEgui App is created here
+    eframe::run_native(
+        "melon_egui",
+        options,
+        Box::new(move |cc| Ok(Box::new(app::MelonEgui::new(cc, rom, shot, renderer, mp)))),
+    )
+}
+
+/// The lunaris icon, for the window and the task bar.
+///
+/// The same `docs/icons/icon.ico` `build.rs` stamps into the executable, and
+/// the same one `gui/egui` shows — one icon for every front end in the project.
+/// The resource in the executable is only used by the shell, and only in a
+/// release build; a window has to be told separately, and at run time.
+///
+/// A malformed or missing icon leaves the window with the system default rather
+/// than stopping the emulator starting, which is what an icon is worth.
+fn lunaris_icon() -> egui::IconData {
+    const BYTES: &[u8] = include_bytes!("../../../docs/icons/icon.ico");
+
+    let decoded = ico::IconDir::read(std::io::Cursor::new(BYTES))
+        .ok()
+        .and_then(|dir| dir.entries().first().and_then(|entry| entry.decode().ok()));
+    match decoded {
+        Some(image) => egui::IconData {
+            width: image.width(),
+            height: image.height(),
+            rgba: image.rgba_data().to_vec(),
+        },
+        None => {
+            log::warn!("could not read the window icon; using the system default");
+            egui::IconData::default()
+        }
+    }
+}
+
+/// Take a bare flag out of `argv`, reporting whether it was there.
+/// Take `--lan-host` or `--lan-join <ip>` out of `argv` and open that
+/// melonDS LAN session before any console boots. Exits on failure: a LAN run
+/// that silently fell back to local play would test nothing.
+fn start_lan(argv: &mut Vec<String>) {
+    use melonds_net::{lan, mp};
+    let joined = argv.iter().position(|a| a == "--lan-join").map(|at| {
+        argv.remove(at);
+        if at < argv.len() {
+            argv.remove(at)
+        } else {
+            String::from("127.0.0.1")
+        }
+    });
+    let host = take_flag(argv, "--lan-host");
+    if !host && joined.is_none() {
+        return;
+    }
+    melonds_net::init_logging();
+    mp::set_backend(mp::MpBackend::Lan);
+    // A host services ENet once its console runs frames, so a join can land
+    // before the host is listening: retry over ~30 s (each try waits 5 s).
+    let result = match &joined {
+        Some(addr) => (0..6)
+            .map(|_| lan::join("melon_egui", addr))
+            .find(Result::is_ok)
+            .unwrap_or(Err(lan::LanError::Failed)),
+        None => lan::host("melon_egui", 16),
+    };
+    if let Err(e) = result {
+        log::error!("LAN: {e}");
+        std::process::exit(2);
+    }
+    log::info!(
+        "LAN: {} ({:?})",
+        if host { "hosting" } else { "joined" },
+        lan::players()
+    );
+}
+
+fn take_flag(argv: &mut Vec<String>, flag: &str) -> bool {
+    let Some(at) = argv.iter().position(|arg| arg == flag) else {
+        return false;
+    };
+    argv.remove(at);
+    true
+}
+
+/// Take `--renderer <software|opengl|compute>[@scale]` out of `argv`, if it is
+/// there.
+///
+/// It overrides the saved Video settings for this run only. That is what makes
+/// the renderers comparable from a shell: three `--shot` captures of the same
+/// cart at the same frame, one per renderer, are the evidence that the OpenGL
+/// path draws the same picture and that its internal resolution reaches the
+/// rasteriser.
+fn take_renderer(argv: &mut Vec<String>) -> Option<(video::Renderer, u32)> {
+    let at = argv.iter().position(|arg| arg == "--renderer")?;
+    let value = argv.get(at + 1).cloned().unwrap_or_default();
+    argv.drain(at..(at + 2).min(argv.len()));
+
+    let (name, scale) = value.split_once('@').unwrap_or((value.as_str(), "1"));
+    let renderer = match name {
+        "software" | "soft" => video::Renderer::Software,
+        "opengl" | "gl" => video::Renderer::OpenGl,
+        "compute" => video::Renderer::Compute,
+        _ => {
+            log::error!("usage: --renderer <software|opengl|compute>[@scale]");
+            std::process::exit(2);
+        }
+    };
+    let scale = scale.parse().unwrap_or(1);
+    Some((renderer, scale))
+}
